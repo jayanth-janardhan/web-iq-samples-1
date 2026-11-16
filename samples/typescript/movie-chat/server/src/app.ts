@@ -6,6 +6,7 @@ import express, { type ErrorRequestHandler } from "express";
 
 import { logEvent, requestContext } from "./logging.js";
 import type { MovieChatService } from "./movieChatService.js";
+import { WebIqDailyQuotaError } from "./webIqClient.js";
 
 export function createApp(service: MovieChatService, clientDistPath?: string) {
   const app = express();
@@ -81,6 +82,10 @@ export function createApp(service: MovieChatService, clientDistPath?: string) {
       requestId: response.getHeader("x-request-id"),
       errorType: error instanceof Error ? error.name : "UnknownError",
     }, "error");
+    if (error instanceof WebIqDailyQuotaError) {
+      response.status(429).json({ error: error.message });
+      return;
+    }
     response
       .status(500)
       .json({

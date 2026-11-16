@@ -14,7 +14,7 @@ import { emptyPreferences } from "./types.js";
 import { SessionStore } from "./sessionStore.js";
 import type { MovieModel } from "./movieModel.js";
 import type { QueryPlanner } from "./queryPlanner.js";
-import { mergeSources, type WebIqClient } from "./webIqClient.js";
+import { mergeSources, WebIqClient } from "./webIqClient.js";
 
 beforeEach(() => {
   vi.spyOn(console, "info").mockImplementation(() => undefined);
@@ -133,7 +133,7 @@ it("skips iterative assessment when the initial plan requires no retrieval", asy
       { mode: "iterative", maxIterations: 5, maxQueriesPerIteration: 5, maxTotalQueries: 8 }, 30,
     );
     const response = await service.chat(undefined, "I like science fiction.");
-    expect(webIq.search).toHaveBeenCalledExactlyOnceWith([]);
+    expect(webIq.search).toHaveBeenCalledExactlyOnceWith([], 8);
     expect(planner.planFollowUp).not.toHaveBeenCalled();
     expect(response.debug.totals).toMatchObject({ modelCalls: 2, webIqCalls: 0 });
   } finally {
@@ -201,8 +201,10 @@ it("retrieves a ranking, fans out to discovered actors, and stops when the plann
     expect(webIq.search).toHaveBeenCalledTimes(2);
     expect(webIq.search).toHaveBeenNthCalledWith(1, [
       { query: rankingQuery.query, autoMode: "advanced" },
-    ]);
-    expect(webIq.search).toHaveBeenNthCalledWith(2, actorQueries.map(({ query, autoMode }) => ({ query, autoMode })));
+    ], 8);
+    expect(webIq.search).toHaveBeenNthCalledWith(
+      2, actorQueries.map(({ query, autoMode }) => ({ query, autoMode })), 7,
+    );
     expect(response.debug.webIqCalls.map(({ autoMode }) => autoMode)).toEqual(["advanced", "lite", "lite"]);
     expect(response.debug.totals).toMatchObject({ modelCalls: 4, webIqCalls: 3 });
     expect(response.debug.evidence.map(({ url }) => url))
@@ -211,6 +213,52 @@ it("retrieves a ranking, fans out to discovered actors, and stops when the plann
     expect(model.respond.mock.calls[0]![5]).toBe(false);
   } finally {
     sessions.close();
+  }
+});
+
+it("counts transport retries against the turn budget and exposes their status in diagnostics", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json({ retryAfter: "1s" }, { status: 429 }))
+    .mockResolvedValueOnce(Response.json({ results: [] }))
+    .mockResolvedValueOnce(Response.json({ results: [] }));
+  vi.stubGlobal("fetch", fetchMock);
+  const sessions = new SessionStore(120, 12);
+  const planner = {
+    planInitial: vi.fn().mockResolvedValue([{ query: "initial", purpose: "Initial fact", iteration: 1 }]),
+    planFollowUp: vi.fn().mockResolvedValue({
+      queries: [{ query: "gap", purpose: "Missing fact", iteration: 2 }],
+    }),
+  };
+  const model = {
+    respond: vi.fn().mockResolvedValue({ message: "No supported facts.", preferences: emptyPreferences() }),
+  };
+  try {
+    const service = new MovieChatService(
+      sessions, new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30),
+      planner as unknown as QueryPlanner, model as unknown as MovieModel, "model",
+      { mode: "iterative", maxIterations: 5, maxQueriesPerIteration: 5, maxTotalQueries: 3 }, 30,
+    );
+    const pending = service.chat(undefined, "Compare these films.");
+    await vi.advanceTimersByTimeAsync(1_000);
+    const response = await pending;
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(planner.planFollowUp).toHaveBeenCalledOnce();
+    expect(planner.planFollowUp.mock.calls[0]![5]).toBe(1);
+    expect(response.debug.totals.webIqCalls).toBe(3);
+    expect(response.debug.webIqCalls.map(({ query, status, attempt }) => ({ query, status, attempt })))
+      .toEqual([
+        { query: "initial", status: 429, attempt: 1 },
+        { query: "initial", status: 200, attempt: 2 },
+        { query: "gap", status: 200, attempt: 1 },
+      ]);
+    expect(model.respond.mock.calls[0]![5]).toBe(true);
+  } finally {
+    sessions.close();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
   }
 });
 
@@ -299,7 +347,7 @@ it.each([
     );
     const response = await service.chat(undefined, "Show me the Jaws movie poster");
     expect(planner.planFollowUp).not.toHaveBeenCalled();
-    expect(webIq.search).toHaveBeenCalledExactlyOnceWith([{ query: query.query, autoMode: "lite" }]);
+    expect(webIq.search).toHaveBeenCalledExactlyOnceWith([{ query: query.query, autoMode: "lite" }], 8);
     expect(response.debug.totals.modelCalls).toBe(modelCalls);
     if (answerDurationsMs) {
       expect(response.debug.modelCalls.slice(1).map(({ durationMs }) => durationMs)).toEqual(answerDurationsMs);

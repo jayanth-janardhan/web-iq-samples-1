@@ -208,4 +208,42 @@ describe("createApp", () => {
     expect(JSON.stringify([errorLog.mock.calls, response.body]))
       .not.toMatch(/secret-token|private prompt|private movie/);
   });
+
+  it("returns an immediate, safe quota error and correlates the upstream failure log", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      errorCode: "AuthUserDailyUsageExceeded",
+      retryAfter: "86400s",
+      traceId: "daily-quota-trace",
+      userMessage: "private upstream message",
+      technicalDetails: "private upstream details",
+    }, { status: 429 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const webIq = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30);
+    const service = {
+      chat: vi.fn(async () => webIq.search([{ query: "movie" }])),
+    } as unknown as MovieChatService;
+    const response = await request(createApp(service))
+      .post("/api/chat")
+      .send({ message: "Recommend a movie." });
+
+    expect(response.status).toBe(429);
+    expect(response.body).toEqual({
+      error: "The app's Web IQ daily request quota has been reached. Please try again later or contact the app administrator.",
+    });
+    expect(response.headers).not.toHaveProperty("retry-after");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const logs = errorLog.mock.calls.map(([line]) => JSON.parse(line as string));
+    expect(logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: "webiq_request", status: 429, traceId: "daily-quota-trace",
+        errorType: "WebIqDailyQuotaError", requestId: response.headers["x-request-id"],
+      }),
+      expect.objectContaining({
+        event: "api_error", errorType: "WebIqDailyQuotaError",
+        requestId: response.headers["x-request-id"],
+      }),
+    ]));
+    expect(JSON.stringify([logs, response.body])).not.toMatch(/private upstream|test-access-token/);
+  });
 });

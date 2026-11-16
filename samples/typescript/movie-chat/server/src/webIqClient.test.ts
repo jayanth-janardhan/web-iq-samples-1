@@ -13,6 +13,7 @@ describe("WebIqClient", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
@@ -121,6 +122,7 @@ describe("WebIqClient", () => {
       traceId: "auto-trace-1",
       outcome: "success",
       durationMs: expect.any(Number),
+      attempt: 1,
       resultCount: 1,
       sourceCount: 1,
       query: "Arrival reviews",
@@ -221,8 +223,8 @@ describe("WebIqClient", () => {
   it.each([
     {
       name: "HTTP failure",
-      response: () => Response.json({ traceId: "rate-limit-trace", message: "private upstream details" }, { status: 429 }),
-      status: 429, traceId: "rate-limit-trace",
+      response: () => Response.json({ traceId: "invalid-request-trace", message: "private upstream details" }, { status: 400 }),
+      status: 400, traceId: "invalid-request-trace",
     },
     {
       name: "invalid results",
@@ -401,5 +403,205 @@ describe("WebIqClient", () => {
     const client = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30);
     expect((await client.search([{ query: "no matches" }])).sources).toEqual([]);
     await expect(client.search([{ query: "wrong contract" }])).rejects.toThrow("invalid results array");
+  });
+
+  describe("rate limiting and retries", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-01-01T12:00:00Z"));
+      vi.spyOn(Math, "random").mockReturnValue(0);
+    });
+
+    it.each([
+      { name: "body duration", retryAfter: "2s", headers: {}, milliseconds: 2_000 },
+      { name: "body timestamp", retryAfter: "2026-01-01T12:00:02Z", headers: {}, milliseconds: 2_000 },
+      { name: "header seconds", retryAfter: undefined, headers: { "Retry-After": "2" }, milliseconds: 2_000 },
+      { name: "header date", retryAfter: undefined, headers: { "Retry-After": "Thu, 01 Jan 2026 12:00:02 GMT" }, milliseconds: 2_000 },
+      { name: "longer body hint", retryAfter: "3s", headers: { "Retry-After": "2" }, milliseconds: 3_000 },
+      { name: "longer header hint", retryAfter: "2s", headers: { "Retry-After": "3" }, milliseconds: 3_000 },
+      { name: "invalid hint", retryAfter: "not a delay", headers: {}, milliseconds: 1_000 },
+      { name: "negative hint", retryAfter: "-2s", headers: {}, milliseconds: 1_000 },
+    ])("waits for the $name before retrying and records every attempt", async ({ retryAfter, headers, milliseconds }) => {
+      const responseHeaders = new Headers();
+      if (headers["Retry-After"]) responseHeaders.set("Retry-After", headers["Retry-After"]);
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(Response.json({
+          errorCode: "AuthUserThrottled", retryAfter, traceId: "throttled-trace",
+          technicalDetails: "private details",
+        }, { status: 429, headers: responseHeaders }))
+        .mockResolvedValueOnce(Response.json({ results: [], traceId: "success-trace" }));
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30);
+      const pending = client.search([{ query: "movie" }]);
+      await vi.advanceTimersByTimeAsync(milliseconds - 1);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await pending;
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.calls).toMatchObject([
+        { query: "movie", attempt: 1, status: 429, traceId: "throttled-trace" },
+        { query: "movie", attempt: 2, status: 200, traceId: "success-trace" },
+      ]);
+      expect(result.calls[1]!.durationMs).toBeGreaterThanOrEqual(milliseconds);
+      expect(console.error).toHaveBeenCalledOnce();
+      expect(console.info).toHaveBeenCalledOnce();
+      expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toMatch(/private details|test-access-token/);
+    });
+
+    it("uses increasing backoff with jitter and stops after three attempts", async () => {
+      vi.mocked(Math.random).mockReturnValue(0.5);
+      const fetchMock = vi.fn().mockImplementation(async () => Response.json({}, { status: 429 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30);
+      const failure = expect(client.search([{ query: "movie" }])).rejects.toThrow("429");
+      await vi.advanceTimersByTimeAsync(1_124);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(2_124);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      await failure;
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it("retries transient server errors using the documented 30-second fallback", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(Response.json({ errorCode: "InternalServerError" }, { status: 500 }))
+        .mockResolvedValueOnce(Response.json({ results: [] }));
+      vi.stubGlobal("fetch", fetchMock);
+      const pending = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30)
+        .search([{ query: "movie" }]);
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await pending).calls).toHaveLength(2);
+    });
+
+    it.each(["AuthUserDailyUsageExceeded", "authuserdailyusageexceeded"])("logs %s and fails without retrying or waiting for midnight", async (errorCode) => {
+      const fetchMock = vi.fn().mockImplementation(async () => Response.json({
+        errorCode, retryAfter: "86400s", traceId: "daily-quota-trace",
+        technicalDetails: "private upstream details",
+      }, { status: 429 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30);
+      await expect(client.search([{ query: "movie" }])).rejects.toMatchObject({
+        name: "WebIqDailyQuotaError", message: expect.stringContaining("daily request quota"),
+      });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      await expect(client.search([{ query: "another movie" }])).rejects.toMatchObject({
+        name: "WebIqDailyQuotaError",
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(Date.now()).toBe(Date.parse("2026-01-01T12:00:00Z"));
+      const logs = vi.mocked(console.error).mock.calls.map(([line]) => JSON.parse(line as string));
+      expect(logs).toHaveLength(2);
+      expect(logs[0]).toMatchObject({
+        status: 429, traceId: "daily-quota-trace", outcome: "error", errorType: "WebIqDailyQuotaError",
+      });
+      expect(JSON.stringify(logs)).not.toContain("private upstream details");
+      fetchMock.mockResolvedValueOnce(Response.json({ results: [] }));
+      await client.search([{ query: "movie" }]);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it("fails promptly rather than shortening a retry hint beyond the time limit", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(Response.json({ retryAfter: "120s" }, { status: 429 }));
+      vi.stubGlobal("fetch", fetchMock);
+      await expect(new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30)
+        .search([{ query: "movie" }])).rejects.toThrow("429");
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(Date.now()).toBe(Date.parse("2026-01-01T12:00:00Z"));
+    });
+
+    it("shares the throttle cooldown with subsequent searches even when no retry budget remains", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(Response.json({ retryAfter: "2s" }, { status: 429 }))
+        .mockResolvedValueOnce(Response.json({ results: [] }));
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30);
+      await expect(client.search([{ query: "movie" }], 1)).rejects.toThrow("429");
+      const pending = client.search([{ query: "another movie" }]);
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("caps concurrent HTTP requests across overlapping searches", async () => {
+      const completions: Array<(response: Response) => void> = [];
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(() => new Promise<Response>((resolve) => {
+        completions.push(resolve);
+      })));
+      const client = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30);
+      const pending = Promise.all(["first", "second", "third"].map((query) => client.search([{ query }])));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      completions[0]!(Response.json({ results: [] }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetch).toHaveBeenCalledTimes(3);
+      completions[1]!(Response.json({ results: [] }));
+      completions[2]!(Response.json({ results: [] }));
+      await pending;
+    });
+
+    it("cancels retry waits when the batch timeout signal fires", async () => {
+      const timeout = new AbortController();
+      vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(async () =>
+        Response.json({ retryAfter: "2s" }, { status: 429 })));
+      const pending = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30)
+        .search([{ query: "movie" }]);
+      const failure = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      await vi.advanceTimersByTimeAsync(1_000);
+      timeout.abort();
+      await failure;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(fetch).toHaveBeenCalledOnce();
+    });
+
+    it("aborts sibling HTTP requests and never dispatches queued queries after a batch failure", async () => {
+      let siblingSignal: AbortSignal | undefined;
+      const fetchMock = vi.fn().mockImplementation(async (_url, options) => {
+        if (JSON.parse(options.body).query === "invalid") {
+          return Response.json({}, { status: 400 });
+        }
+        siblingSignal = options.signal;
+        return new Promise<Response>((_resolve, reject) => {
+          siblingSignal!.addEventListener("abort", () => reject(siblingSignal!.reason), { once: true });
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await expect(new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30)
+        .search([{ query: "invalid" }, { query: "in flight" }, { query: "queued" }]))
+        .rejects.toThrow("400");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(siblingSignal?.aborted).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("reserves initial attempts for every query within the shared call budget", async () => {
+      const fetchMock = vi.fn().mockImplementation(async (_url, options) => {
+        const { query } = JSON.parse(options.body);
+        return query === "throttled" ? Response.json({}, { status: 429 }) : Response.json({ results: [] });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30);
+      const failure = expect(client.search([{ query: "throttled" }, { query: "other" }], 3))
+        .rejects.toThrow("429");
+      await vi.advanceTimersByTimeAsync(1_000);
+      await failure;
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock.mock.calls.map(([, options]) => JSON.parse(options.body).query).sort())
+        .toEqual(["other", "throttled", "throttled"]);
+    });
+
+    it.each([400, 401, 403])("does not retry HTTP %i", async (status) => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({}, { status })));
+      await expect(new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30)
+        .search([{ query: "movie" }])).rejects.toThrow(String(status));
+      expect(fetch).toHaveBeenCalledOnce();
+    });
   });
 });

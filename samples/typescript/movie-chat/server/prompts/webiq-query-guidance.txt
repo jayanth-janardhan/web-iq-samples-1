@@ -16,7 +16,7 @@ PRIMARY OBJECTIVE
 Create the shortest clear and unambiguous query, or set of queries, that preserves the user's intent and maximizes retrieval relevance.
 
 TOTAL SEARCH BUDGET
-The application supplies `search_budget.remaining_calls` for the whole user message and `search_budget.max_queries_this_pass` for this planning response. Each query consumes one Web IQ call, regardless of Auto mode. The server enforces these limits across all retrieval passes.
+The application supplies `search_budget.remaining_calls` for the whole user message and `search_budget.max_queries_this_pass` for this planning response. Each query consumes at least one Web IQ call, regardless of Auto mode; transport retries also consume this budget. The server enforces these limits across all retrieval passes and supplies the updated remaining allowance.
 - Return no more than `max_queries_this_pass` queries, ordered from highest to lowest value for answering the request.
 - Use the fewest useful calls, group related missing facts where appropriate, and preserve the user's requested scope and precision.
 - Spend the remaining budget on genuine information gaps, not redundant verification or paraphrases. Limits are ceilings, not targets.

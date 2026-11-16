@@ -53,7 +53,6 @@ export class MovieChatService {
       remainingSearches,
       session.messages,
     )).slice(0, Math.min(this.queryPlanning.maxQueriesPerIteration, remainingSearches));
-    remainingSearches -= plannedQueries.length;
     modelCalls.push({
       stage: "query_planning",
       purpose: "Plan focused Web IQ retrieval queries.",
@@ -62,7 +61,9 @@ export class MovieChatService {
     });
     const initialSearch = await this.webIq.search(
       plannedQueries.map(({ query, autoMode = "lite" }) => ({ query, autoMode })),
+      remainingSearches,
     );
+    remainingSearches -= initialSearch.calls.length;
     let sources = initialSearch.sources;
     const webIqCalls = toWebIqCallDebug(plannedQueries, initialSearch.calls);
 
@@ -96,10 +97,11 @@ export class MovieChatService {
           break;
         }
         plannedQueries.push(...queries);
-        remainingSearches -= queries.length;
         const additionalSearch = await this.webIq.search(
           queries.map(({ query, autoMode = "lite" }) => ({ query, autoMode })),
+          remainingSearches,
         );
+        remainingSearches -= additionalSearch.calls.length;
         webIqCalls.push(
           ...toWebIqCallDebug(queries, additionalSearch.calls),
         );
@@ -196,6 +198,8 @@ function toWebIqCallDebug(
       autoMode: call.autoMode ?? planned.autoMode ?? "lite",
       durationMs: call.durationMs,
       traceId: call.traceId,
+      attempt: call.attempt,
+      status: call.status,
     };
   });
 }

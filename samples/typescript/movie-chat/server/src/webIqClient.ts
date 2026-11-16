@@ -8,10 +8,22 @@ import type { MediaEvidence, WebIqPassage, WebIqQuery, WebIqSource } from "./typ
 
 const MAX_SOURCE_CONTENT = 3000;
 const MAX_SOURCE_PASSAGES = 8;
+const MAX_ATTEMPTS = 3;
+const REQUEST_TIMEOUT_MS = 60_000;
+const MAX_CONCURRENT_REQUESTS = 2;
+
+export class WebIqDailyQuotaError extends Error {
+  constructor() {
+    super("The app's Web IQ daily request quota has been reached. Please try again later or contact the app administrator.");
+    this.name = "WebIqDailyQuotaError";
+  }
+}
 
 export interface WebIqSearchCall extends WebIqQuery {
   durationMs: number;
   traceId?: string;
+  attempt?: number;
+  status?: number;
 }
 
 export interface WebIqSearchResult {
@@ -86,6 +98,9 @@ export function mergeSources(
 }
 
 export class WebIqClient {
+  private readonly inFlight = new Set<Promise<void>>();
+  private retryNotBefore = 0;
+
   constructor(
     private readonly getAccessToken: () => Promise<string>,
     private readonly baseUrl: string,
@@ -93,93 +108,198 @@ export class WebIqClient {
     private readonly maxSources: number,
   ) {}
 
-  async search(queries: WebIqQuery[]): Promise<WebIqSearchResult> {
-    const resultSets = await Promise.all(
-      queries.map((query) => this.searchOne(query)),
-    );
-    return {
-      sources: mergeSources([], resultSets.flatMap(({ sources }) => sources), this.maxSources),
-      calls: resultSets.map(({ query, autoMode, durationMs, traceId }) => ({
-        query,
-        autoMode,
-        durationMs,
-        traceId,
-      })),
+  async search(queries: WebIqQuery[], maxCalls = queries.length * MAX_ATTEMPTS): Promise<WebIqSearchResult> {
+    if (!Number.isInteger(maxCalls) || maxCalls < queries.length) {
+      throw new Error("The Web IQ call budget must cover the initial queries.");
+    }
+    let remainingRetries = Math.max(0, maxCalls - queries.length);
+    const takeRetry = () => {
+      if (remainingRetries <= 0) return false;
+      remainingRetries -= 1;
+      return true;
     };
-  }
-
-  private async searchOne({ query, autoMode = "lite" }: WebIqQuery): Promise<WebIqSearchCall & {
-    sources: Array<Omit<WebIqSource, "id">>;
-  }> {
-    const startedAt = performance.now();
-    const logRetrievalDetails = process.env["MOVIE_CHAT_LOG_RETRIEVAL_DETAILS"] !== "false";
-    let status: number | undefined;
-    let traceId: string | undefined;
-    let resultCount: number | undefined;
-    let sourceCount: number | undefined;
-    let outcome: "success" | "error" = "error";
-    let errorType: string | undefined;
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
+    const deadline = Date.now() + REQUEST_TIMEOUT_MS;
     try {
-      const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/auto`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${await this.getAccessToken()}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          query,
-          mode: autoMode,
-          contentType: "passage",
-          maxLength: 3000,
-          maxResponseLength: this.maxResponseLength,
-          responseFilter: ["web", "news", "images", "videos"],
-          language: "en",
-          region: "US",
-        }),
-        signal: AbortSignal.timeout(60_000),
-      });
-      status = response.status;
-      const payload: unknown = await response.json().catch(() => undefined);
-      if (isRecord(payload) && typeof payload.traceId === "string") {
-        traceId = payload.traceId;
-      }
-      if (!response.ok) {
-        throw new Error(
-          `Web IQ Auto request failed with ${response.status} ${response.statusText}.`,
-        );
-      }
-      if (!isRecord(payload) || !Array.isArray(payload.results)) {
-        throw new Error("Web IQ Auto returned an invalid results array.");
-      }
-      resultCount = payload.results.length;
-      const sources = payload.results.flatMap((result) => normalizeResult(result, query));
-      sourceCount = sources.length;
-      outcome = "success";
+      const resultSets = await Promise.all(
+        queries.map((query) => this.searchQueued(query, takeRetry, deadline, signal)),
+      );
       return {
-        query,
-        autoMode,
-        durationMs: elapsedMilliseconds(startedAt),
-        traceId,
-        sources,
+        sources: mergeSources([], resultSets.flatMap(({ sources }) => sources), this.maxSources),
+        calls: resultSets.flatMap(({ calls }) => calls),
       };
     } catch (error) {
-      errorType = error instanceof Error ? error.name : "UnknownError";
+      controller.abort();
       throw error;
-    } finally {
-      logEvent("webiq_request", {
-        operation: "auto",
-        autoMode,
-        status: status ?? null,
-        traceId: traceId ?? null,
-        outcome,
-        durationMs: elapsedMilliseconds(startedAt),
-        resultCount,
-        sourceCount,
-        errorType,
-        ...(logRetrievalDetails ? { query } : {}),
-      }, outcome === "error" ? "error" : "info");
     }
   }
+
+  private async searchQueued(
+    query: WebIqQuery,
+    takeRetry: () => boolean,
+    deadline: number,
+    signal: AbortSignal,
+  ) {
+    while (this.inFlight.size >= MAX_CONCURRENT_REQUESTS) {
+      await Promise.race(this.inFlight);
+    }
+    signal.throwIfAborted();
+    const request = this.searchOne(query, takeRetry, deadline, signal);
+    const settled = request.then(() => undefined, () => undefined);
+    this.inFlight.add(settled);
+    try {
+      return await request;
+    } finally {
+      this.inFlight.delete(settled);
+    }
+  }
+
+  private async searchOne(
+    { query, autoMode = "lite" }: WebIqQuery,
+    takeRetry: () => boolean,
+    deadline: number,
+    signal: AbortSignal,
+  ): Promise<{
+    calls: WebIqSearchCall[];
+    sources: Array<Omit<WebIqSource, "id">>;
+  }> {
+    const calls: WebIqSearchCall[] = [];
+    const logRetrievalDetails = process.env["MOVIE_CHAT_LOG_RETRIEVAL_DETAILS"] !== "false";
+    let retryAt = 0;
+    for (let attempt = 1; ; attempt += 1) {
+      const startedAt = performance.now();
+      let status: number | undefined;
+      let traceId: string | undefined;
+      let resultCount: number | undefined;
+      let sourceCount: number | undefined;
+      let outcome: "success" | "error" = "error";
+      let errorType: string | undefined;
+      let retryable = false;
+      try {
+        await wait(Math.max(0, retryAt - Date.now()), signal);
+        await this.waitForCooldown(deadline, signal);
+        const accessToken = await this.getAccessToken();
+        await this.waitForCooldown(deadline, signal);
+        signal.throwIfAborted();
+        const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/auto`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            query,
+            mode: autoMode,
+            contentType: "passage",
+            maxLength: 3000,
+            maxResponseLength: this.maxResponseLength,
+            responseFilter: ["web", "news", "images", "videos"],
+            language: "en",
+            region: "US",
+          }),
+          signal,
+        });
+        status = response.status;
+        const payload: unknown = await response.json().catch(() => undefined);
+        signal.throwIfAborted();
+        if (isRecord(payload) && typeof payload.traceId === "string") {
+          traceId = payload.traceId;
+        }
+        if (!response.ok) {
+          const errorCode = isRecord(payload) && typeof payload.errorCode === "string"
+            ? payload.errorCode.toLowerCase() : "";
+          if (errorCode === "authuserdailyusageexceeded") {
+            throw new WebIqDailyQuotaError();
+          }
+          retryable = status === 429 || status === 500;
+          if (retryable) {
+            const now = Date.now();
+            const backoffMs = (status === 500 ? 30_000 : 1_000) * 2 ** (attempt - 1);
+            const bodyDelay = parseRetryDelay(isRecord(payload) ? payload.retryAfter : undefined, now);
+            const headerDelay = parseRetryDelay(response.headers.get("retry-after"), now);
+            retryAt = now + Math.max(bodyDelay ?? 0, headerDelay ?? 0,
+              Math.min(backoffMs, 30_000)) + Math.floor(Math.random() * 250);
+            if (status === 429) {
+              this.retryNotBefore = Math.max(this.retryNotBefore, retryAt);
+            }
+          }
+          throw new Error(
+            `Web IQ Auto request failed with ${response.status} ${response.statusText}.`,
+          );
+        }
+        if (!isRecord(payload) || !Array.isArray(payload.results)) {
+          throw new Error("Web IQ Auto returned an invalid results array.");
+        }
+        resultCount = payload.results.length;
+        const sources = payload.results.flatMap((result) => normalizeResult(result, query));
+        sourceCount = sources.length;
+        outcome = "success";
+        return { calls, sources };
+      } catch (error) {
+        errorType = error instanceof Error ? error.name : "UnknownError";
+        if (!retryable || attempt >= MAX_ATTEMPTS || retryAt >= deadline || !takeRetry()) {
+          throw error;
+        }
+      } finally {
+        const durationMs = elapsedMilliseconds(startedAt);
+        // Only dispatched HTTP attempts consume the caller's retrieval budget.
+        if (status !== undefined) {
+          calls.push({ query, autoMode, durationMs, traceId, attempt, status });
+        }
+        logEvent("webiq_request", {
+          operation: "auto",
+          autoMode,
+          status: status ?? null,
+          traceId: traceId ?? null,
+          outcome,
+          durationMs,
+          attempt,
+          resultCount,
+          sourceCount,
+          errorType,
+          ...(logRetrievalDetails ? { query } : {}),
+        }, outcome === "error" ? "error" : "info");
+      }
+    }
+  }
+
+  private async waitForCooldown(deadline: number, signal: AbortSignal): Promise<void> {
+    while (this.retryNotBefore > Date.now()) {
+      if (this.retryNotBefore >= deadline) {
+        throw new Error("Web IQ is rate limited beyond this request's time limit. Try again later.");
+      }
+      await wait(this.retryNotBefore - Date.now(), signal);
+    }
+  }
+}
+
+function parseRetryDelay(value: unknown, now: number): number | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const text = value.trim();
+  if (/^\d+(?:\.\d+)?s?$/i.test(text)) {
+    const milliseconds = Number.parseFloat(text) * 1_000;
+    return Number.isFinite(milliseconds) ? milliseconds : undefined;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}T|^[A-Za-z]{3},/.test(text)) return undefined;
+  const timestamp = Date.parse(text);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - now) : undefined;
+}
+
+function wait(milliseconds: number, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  if (milliseconds <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function normalizeResult(result: unknown, query: string): Array<Omit<WebIqSource, "id">> {

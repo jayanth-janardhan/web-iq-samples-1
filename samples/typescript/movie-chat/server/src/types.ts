@@ -68,6 +68,8 @@ export interface ModelCallDebug {
 export interface WebIqCallDebug extends PlannedWebIqQuery {
   durationMs: number;
   traceId?: string;
+  attempt?: number;
+  status?: number;
 }
 
 export interface ChatDebug {
