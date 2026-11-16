@@ -41,18 +41,20 @@ export class MovieChatService {
     }
 
     const session = this.sessions.getOrCreate(sessionId);
-    const retrievalPreferences = shouldUseStoredPreferences(normalizedMessage)
-      ? session.preferences
-      : emptyPreferences();
     const modelCalls: ModelCallDebug[] = [];
     let remainingSearches = this.queryPlanning.maxTotalQueries;
     const queryPlanningStartedAt = performance.now();
-    const plannedQueries = (await this.queryPlanner.planInitial(
+    const initialPlan = await this.queryPlanner.planInitial(
       normalizedMessage,
-      retrievalPreferences,
+      session.preferences,
       remainingSearches,
       session.messages,
-    )).slice(0, Math.min(this.queryPlanning.maxQueriesPerIteration, remainingSearches));
+    );
+    const { useStoredPreferences } = initialPlan;
+    const retrievalPreferences = useStoredPreferences ? session.preferences : emptyPreferences();
+    const plannedQueries = initialPlan.queries.slice(
+      0, Math.min(this.queryPlanning.maxQueriesPerIteration, remainingSearches),
+    );
     modelCalls.push({
       stage: "query_planning",
       purpose: "Plan focused Web IQ retrieval queries.",
@@ -82,6 +84,7 @@ export class MovieChatService {
           iteration,
           remainingSearches,
           session.messages,
+          useStoredPreferences,
         );
         modelCalls.push({
           stage: "evidence_assessment",
@@ -121,6 +124,7 @@ export class MovieChatService {
       sources,
       this.deployment,
       remainingSearches === 0,
+      useStoredPreferences,
     );
     const answerDurations = result.answerDurationsMs ?? [elapsedMilliseconds(answerStartedAt)];
     modelCalls.push(...answerDurations.map((durationMs, index): ModelCallDebug => ({
@@ -160,6 +164,7 @@ export class MovieChatService {
       preferences: result.preferences,
       webIqQueries: plannedQueries,
       debug: {
+        useStoredPreferences,
         modelCalls,
         webIqCalls,
         evidence: sources,
@@ -210,17 +215,6 @@ function sumDurations(calls: Array<{ durationMs: number }>): number {
 
 function elapsedMilliseconds(startedAt: number): number {
   return Math.max(0, Math.round(performance.now() - startedAt));
-}
-
-export function shouldUseStoredPreferences(message: string): boolean {
-  return [
-    /\b(?:something|anything|movies?|films?|recommendations?)\s+(?:that\s+)?i(?:'d| would| might| may)\s+like\b/i,
-    /\bwhat\s+(?:would|might|should)\s+i\s+(?:like|watch)\b/i,
-    /\b(?:based on|using|use|consider)\s+my\s+(?:stored\s+)?(?:preferences?|taste|likes?|dislikes?|history)\b/i,
-    /\b(?:personalized?|tailored)\s+(?:recommendations?\s+)?for\s+me\b/i,
-    /\b(?:recommend|suggest)\s+(?:a\s+movie\s+|something\s+)?for\s+me\b/i,
-    /\bmy\s+(?:movie\s+|viewing\s+)?(?:preferences?|taste)\b/i,
-  ].some((pattern) => pattern.test(message));
 }
 
 export function selectCitedSources(

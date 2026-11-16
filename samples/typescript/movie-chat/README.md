@@ -174,7 +174,9 @@ Open `http://localhost:3000`. Express serves the compiled UI and API from one pr
 
 The model is instructed to update only preferences the user explicitly states or confirms; the server normalizes the returned fields but does not independently verify their provenance. Current preferences appear in the left panel.
 
-Stored preferences are not automatically added to Web IQ queries. They are supplied to the query planner only when the current message explicitly requests personalization, such as `recommend something I would like`, `based on my preferences`, or `for me`. Preferences stated directly in the current message remain part of that message and can affect its query.
+Stored preferences are supplied to the existing Azure OpenAI query planner alongside the current message and bounded conversation history. In that same model call, the planner returns a required boolean `use_stored_preferences` based on the request's meaning, including non-English phrasing, negation, and explicit overrides. It is instructed to use stored preferences only for requested personalization, not unrelated factual questions or general recommendations, and to default to false when unclear. Preferences stated directly in the current message remain part of that message and can affect its query.
+
+The server validates the boolean and carries it through follow-up planning and answer generation; `debug.useStoredPreferences` exposes the decision. Follow-up planners receive stored preferences only when enabled. Opting out for a turn does not erase stored preferences. This replaces the English phrase-matching heuristic without adding a model call. Intent handling remains model-based, not a guaranteed consent or privacy boundary; use explicit application controls where consent is required. Web IQ receives only the generated questions, not the preference object or conversation history; personalized questions can contain relevant preference details.
 
 A preference-only statement can produce an empty query plan. In that case the assistant records the preference and responds without making an unnecessary Web IQ call.
 
@@ -182,7 +184,7 @@ A preference-only statement can produce an empty query plan. In that case the as
 
 For each chat turn, the backend:
 
-1. Sends the request, current UTC date, and up to six recent messages (2,000 characters each) to an Azure OpenAI query planner using `server/prompts/webiq-query-guidance.txt`. Conversation context resolves references such as `Who directed it?`; it is not fresh factual evidence or permission to apply historical preferences. Stored preferences are included only when the current request matches the sample's explicit-personalization checks described above.
+1. Sends the request, stored preferences, current UTC date, and up to six recent messages (2,000 characters each) to an Azure OpenAI query planner using `server/prompts/webiq-query-guidance.txt`. In the same call, the planner decides whether the current request asks for personalized retrieval and produces the queries. Conversation context resolves references such as `Who directed it?`; it is not fresh factual evidence or permission to apply historical preferences.
 2. Validates the planner's JSON output, deduplicates it, and makes a separate `POST https://api.microsoft.ai/v3/auto` request for each focused query, with at most two queries active at a time.
 3. Reads `results[].evidence` and each result's own `citations`, then deduplicates and numbers the supporting sources. Text, image, and video evidence are supported; unsupported or malformed items and explicitly adult results are omitted.
    In the default iterative mode, the planner assesses remaining gaps after retrieval and can issue further targeted queries using entities discovered in the evidence. It stops when no useful follow-up is proposed, the configured pass limit is reached, or the total search budget is exhausted.

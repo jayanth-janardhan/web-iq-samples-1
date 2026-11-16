@@ -19,6 +19,7 @@ interface PlannerOutput {
   mode?: unknown;
   queries?: unknown;
   stop_reason?: unknown;
+  use_stored_preferences?: unknown;
 }
 
 interface PlannerQuery {
@@ -27,8 +28,9 @@ interface PlannerQuery {
   auto_mode?: unknown;
 }
 
-export interface FollowUpPlan {
+export interface QueryPlan {
   queries: PlannedWebIqQuery[];
+  useStoredPreferences: boolean;
   stopReason?: string;
 }
 
@@ -61,7 +63,7 @@ export class QueryPlanner {
     remainingSearches: number,
     history: ConversationMessage[] = [],
     asOf = new Date(),
-  ): Promise<PlannedWebIqQuery[]> {
+  ): Promise<QueryPlan> {
     const output = await this.complete({
       task: "Create the initial Web IQ query plan.",
       current_date: asOf.toISOString().slice(0, 10),
@@ -75,13 +77,12 @@ export class QueryPlanner {
         conversation_context: boundedHistory(history),
       },
     });
-    const plan = parsePlannerOutput(
+    return parsePlannerOutput(
       output,
       "initial",
       1,
       Math.min(this.maxQueriesPerIteration, remainingSearches),
     );
-    return plan.queries;
   }
 
   async planFollowUp(
@@ -92,11 +93,13 @@ export class QueryPlanner {
     iteration: number,
     remainingSearches: number,
     history: ConversationMessage[] = [],
-  ): Promise<FollowUpPlan> {
+    useStoredPreferences = false,
+  ): Promise<QueryPlan> {
     const output = await this.complete({
       task:
         "Assess all supplied evidence at the precision the user requested. Stop when supported figures can answer the request with appropriate dates or caveats. Otherwise create the minimum queries for genuine gaps, batching related missing items rather than searching each row separately.",
       original_user_request: message,
+      use_stored_preferences: useStoredPreferences,
       search_budget: {
         remaining_calls: remainingSearches,
         max_queries_this_pass: Math.min(this.maxQueriesPerIteration, remainingSearches),
@@ -124,6 +127,7 @@ export class QueryPlanner {
       "follow_up",
       iteration,
       this.maxQueriesPerIteration,
+      useStoredPreferences,
     );
     const previous = new Set(
       issuedQueries.map(({ query }) => normalizeForComparison(query)),
@@ -177,7 +181,8 @@ export function parsePlannerOutput(
   expectedMode: "initial" | "follow_up",
   iteration: number,
   maxQueries: number,
-): FollowUpPlan {
+  useStoredPreferences = false,
+): QueryPlan {
   let parsed: PlannerOutput;
   try {
     parsed = JSON.parse(value) as PlannerOutput;
@@ -192,12 +197,19 @@ export function parsePlannerOutput(
   if (!isRecord(parsed)) {
     throw new Error("The query planner response must be a JSON object.");
   }
+  if (expectedMode === "initial") {
+    if (typeof parsed.use_stored_preferences !== "boolean") {
+      throw new Error("The initial query plan must contain a boolean use_stored_preferences.");
+    }
+    useStoredPreferences = parsed.use_stored_preferences;
+  }
   if (parsed.mode === "stop") {
     if (expectedMode === "initial") {
       throw new Error("The query planner cannot stop before the initial search.");
     }
     return {
       queries: [],
+      useStoredPreferences,
       stopReason:
         typeof parsed.stop_reason === "string"
           ? parsed.stop_reason.trim()
@@ -243,6 +255,7 @@ export function parsePlannerOutput(
 
   return {
     queries: queries.slice(0, maxQueries),
+    useStoredPreferences,
   };
 }
 

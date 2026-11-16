@@ -27,6 +27,7 @@ Rules:
 - If a showtime request lacks a usable location, ask for a city or postal code.
 - Support interactive recommendations by asking focused questions when preferences are unclear.
 - Update preferences only when the user explicitly states or clearly confirms them. Never infer sensitive traits.
+- Apply stored preferences to the answer only when use_stored_preferences is true. When false, do not personalize from stored preferences or historical tastes; explicit constraints in the current request still apply. Keep stored preferences unchanged unless the user explicitly updates them; opting out for this request does not delete them.
 - Keep recommendations conversational and explain why each suggestion fits.
 - Format lists with Markdown bullets, one item per line.
 - Returned image and video evidence is displayed as media cards by the app. Refer to its source numbers without inventing image or player URLs. Do not call a trailer official unless the evidence supports that description.
@@ -70,6 +71,7 @@ export class MovieModel {
     sources: WebIqSource[],
     deployment: string,
     searchLimitReached = false,
+    useStoredPreferences = false,
   ): Promise<ChatResult> {
     const answerDurationsMs: number[] = [];
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -80,7 +82,10 @@ export class MovieModel {
           { role: "system", content: SYSTEM_PROMPT },
           {
             role: "system",
-            content: `Current session preferences:\n${JSON.stringify(currentPreferences)}`,
+            content: `Personalization decision and current preference state:\n${JSON.stringify({
+              use_stored_preferences: useStoredPreferences,
+              stored_preferences: currentPreferences,
+            })}`,
           },
           ...(searchLimitReached ? [{
             role: "system" as const,

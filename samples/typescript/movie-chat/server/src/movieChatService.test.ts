@@ -7,7 +7,6 @@ import { requestContext } from "./logging.js";
 import {
   MovieChatService,
   selectCitedSources,
-  shouldUseStoredPreferences,
 } from "./movieChatService.js";
 import type { ChatResult, WebIqQuery, WebIqSource } from "./types.js";
 import { emptyPreferences } from "./types.js";
@@ -50,7 +49,11 @@ const sources: WebIqSource[] = [
   },
 ];
 
-it("supplies conversation references to both planners without opting into stored preferences", async () => {
+it.each([
+  { message: "Who directed it?", useStoredPreferences: false },
+  { message: "Don't use my preferences. Who directed it?", useStoredPreferences: false },
+  { message: "Raad iets aan dat bij mijn smaak past.", useStoredPreferences: true },
+])("carries the planner's personalization decision through the turn: $message", async ({ message, useStoredPreferences }) => {
   const sessions = new SessionStore(120, 12);
   const session = sessions.getOrCreate();
   session.messages = [
@@ -61,7 +64,7 @@ it("supplies conversation references to both planners without opting into stored
   const history = [...session.messages];
   const query = { query: "Arrival director", purpose: "Resolve the film's director", iteration: 1 };
   const planner = {
-    planInitial: vi.fn().mockResolvedValue([query]),
+    planInitial: vi.fn().mockResolvedValue({ queries: [query], useStoredPreferences }),
     planFollowUp: vi.fn().mockResolvedValue({ queries: [] }),
   };
   const webIq = {
@@ -78,13 +81,18 @@ it("supplies conversation references to both planners without opting into stored
       model as unknown as MovieModel, "model",
       { mode: "iterative", maxIterations: 5, maxQueriesPerIteration: 5, maxTotalQueries: 8 }, 30,
     );
-    await service.chat(session.id, "Who directed it?");
+    const response = await service.chat(session.id, message);
     expect(planner.planInitial).toHaveBeenCalledWith(
-      "Who directed it?", emptyPreferences(), 8, history,
+      message, session.preferences, 8, history,
     );
     expect(planner.planFollowUp).toHaveBeenCalledWith(
-      "Who directed it?", emptyPreferences(), [query], [], 2, 7, history,
+      message, useStoredPreferences ? session.preferences : emptyPreferences(),
+      [query], [], 2, 7, history, useStoredPreferences,
     );
+    expect(model.respond.mock.calls[0]![6]).toBe(useStoredPreferences);
+    expect(response.debug.useStoredPreferences).toBe(useStoredPreferences);
+    expect(response.preferences.genres).toEqual(["horror"]);
+    expect(response.debug.totals.modelCalls).toBe(3);
   } finally {
     sessions.close();
   }
@@ -97,7 +105,7 @@ it("does not restore a session deleted while its answer is pending", async () =>
   let started!: () => void;
   const pending = new Promise<ChatResult>((resolve) => { finish = resolve; });
   const answering = new Promise<void>((resolve) => { started = resolve; });
-  const planner = { planInitial: vi.fn().mockResolvedValue([]) };
+  const planner = { planInitial: vi.fn().mockResolvedValue({ queries: [], useStoredPreferences: false }) };
   const webIq = { search: vi.fn().mockResolvedValue({ sources: [], calls: [] }) };
   const model = { respond: vi.fn().mockImplementation(() => { started(); return pending; }) };
   try {
@@ -121,7 +129,10 @@ it("does not restore a session deleted while its answer is pending", async () =>
 
 it("skips iterative assessment when the initial plan requires no retrieval", async () => {
   const sessions = new SessionStore(120, 12);
-  const planner = { planInitial: vi.fn().mockResolvedValue([]), planFollowUp: vi.fn() };
+  const planner = {
+    planInitial: vi.fn().mockResolvedValue({ queries: [], useStoredPreferences: false }),
+    planFollowUp: vi.fn(),
+  };
   const webIq = { search: vi.fn().mockResolvedValue({ sources: [], calls: [] }) };
   const model = {
     respond: vi.fn().mockResolvedValue({ message: "I will remember that.", preferences: emptyPreferences() }),
@@ -164,7 +175,7 @@ it("retrieves a ranking, fans out to discovered actors, and stops when the plann
     content: `A fictional highest-grossing film earned ${index + 1} billion worldwide.`,
   }));
   const planner = {
-    planInitial: vi.fn().mockResolvedValue([rankingQuery]),
+    planInitial: vi.fn().mockResolvedValue({ queries: [rankingQuery], useStoredPreferences: false }),
     planFollowUp: vi.fn()
       .mockResolvedValueOnce({ queries: actorQueries })
       .mockResolvedValueOnce({ queries: [], stopReason: "All requested figures are supported." }),
@@ -227,7 +238,10 @@ it("counts transport retries against the turn budget and exposes their status in
   vi.stubGlobal("fetch", fetchMock);
   const sessions = new SessionStore(120, 12);
   const planner = {
-    planInitial: vi.fn().mockResolvedValue([{ query: "initial", purpose: "Initial fact", iteration: 1 }]),
+    planInitial: vi.fn().mockResolvedValue({
+      queries: [{ query: "initial", purpose: "Initial fact", iteration: 1 }],
+      useStoredPreferences: false,
+    }),
     planFollowUp: vi.fn().mockResolvedValue({
       queries: [{ query: "gap", purpose: "Missing fact", iteration: 2 }],
     }),
@@ -275,7 +289,7 @@ it.each([
     query: `missing fact ${index}`, purpose: "Close a genuine gap", iteration: 2,
   }));
   const planner = {
-    planInitial: vi.fn().mockResolvedValue(initialQueries),
+    planInitial: vi.fn().mockResolvedValue({ queries: initialQueries, useStoredPreferences: false }),
     planFollowUp: vi.fn().mockResolvedValue({ queries: followUpQueries }),
   };
   const webIq = {
@@ -329,7 +343,10 @@ it.each([
     content: "A movie poster.", query: query.query,
     media: { type: "image", imageUrl: "https://images.example.com/jaws.jpg" },
   };
-  const planner = { planInitial: vi.fn().mockResolvedValue([query]), planFollowUp: vi.fn() };
+  const planner = {
+    planInitial: vi.fn().mockResolvedValue({ queries: [query], useStoredPreferences: false }),
+    planFollowUp: vi.fn(),
+  };
   const webIq = {
     search: vi.fn().mockResolvedValue({
       sources: [sources[0], mediaSource],
@@ -373,7 +390,7 @@ it("preserves trace IDs across iterations and exposes the final model evidence w
   const initialQuery = { query: "Arrival reviews", purpose: "Find reviews", iteration: 1 };
   const nextQuery = { query: "Arrival cast", purpose: "Find cast", iteration: 2 };
   const planner = {
-    planInitial: vi.fn().mockResolvedValue([initialQuery]),
+    planInitial: vi.fn().mockResolvedValue({ queries: [initialQuery], useStoredPreferences: false }),
     planFollowUp: vi.fn().mockResolvedValue({ queries: [nextQuery] }),
   };
   const webIq = {
@@ -420,7 +437,9 @@ it.each([
   const sessions = new SessionStore(120, 12);
   const updateSession = vi.spyOn(sessions, "update");
   const query = { query: "Arrival reviews", purpose: "Find reviews", iteration: 1 };
-  const planner = { planInitial: vi.fn().mockResolvedValue([query]) };
+  const planner = {
+    planInitial: vi.fn().mockResolvedValue({ queries: [query], useStoredPreferences: false }),
+  };
   const webIq = {
     search: vi.fn().mockResolvedValue({
       sources: [
@@ -491,26 +510,6 @@ describe("selectCitedSources", () => {
 
   it("returns no sources when the answer has no citations", () => {
     expect(selectCitedSources("What city should I search?", sources)).toEqual([]);
-  });
-});
-
-describe("shouldUseStoredPreferences", () => {
-  it.each([
-    "Recommend something I would like.",
-    "What should I watch based on my preferences?",
-    "Give me a personalized recommendation for me.",
-    "What would I like?",
-  ])("uses stored preferences for explicit personalization: %s", (message) => {
-    expect(shouldUseStoredPreferences(message)).toBe(true);
-  });
-
-  it.each([
-    "What did critics think about Arrival?",
-    "Recommend a thoughtful science-fiction movie.",
-    "Find showtimes near Seattle.",
-    "I like mysteries but not horror. What is new this week?",
-  ])("does not assume stored preferences for: %s", (message) => {
-    expect(shouldUseStoredPreferences(message)).toBe(false);
   });
 });
 

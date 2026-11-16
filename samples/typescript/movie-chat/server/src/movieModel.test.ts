@@ -102,6 +102,24 @@ describe("MovieModel copying safeguard", () => {
       .toContain("Do not reproduce passages");
   });
 
+  it.each([false, true])("passes the turn's personalization policy without discarding preferences: %s", async (useStoredPreferences) => {
+    createCompletion.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ message: "A movie answer." }) } }],
+    });
+    const preferences = { ...emptyPreferences(), genres: ["science fiction"] };
+    const result = await new MovieModel("key", "https://example.com", "model", "version")
+      .respond("Recommend a film.", [], preferences, [], "model", false, useStoredPreferences);
+    const messages = createCompletion.mock.calls[0]![0].messages;
+    expect(messages[0].content).toContain("Apply stored preferences to the answer only when");
+    const policy = JSON.parse(messages[1].content.split("\n").slice(1).join("\n"));
+    expect(policy).toEqual({
+      use_stored_preferences: useStoredPreferences,
+      stored_preferences: preferences,
+    });
+    expect(result.preferences).toEqual(preferences);
+    expect(createCompletion).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("retries copying once and preserves search-limit disclosure when exhausted=%s", async (searchLimitReached) => {
     createCompletion
       .mockResolvedValueOnce(completion(`${passage} [1]`, ["horror"]))

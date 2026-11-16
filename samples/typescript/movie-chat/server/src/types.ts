@@ -73,6 +73,7 @@ export interface WebIqCallDebug extends PlannedWebIqQuery {
 }
 
 export interface ChatDebug {
+  useStoredPreferences?: boolean;
   modelCalls: ModelCallDebug[];
   webIqCalls: WebIqCallDebug[];
   evidence: WebIqSource[];

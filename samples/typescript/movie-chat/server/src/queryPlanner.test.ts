@@ -21,7 +21,9 @@ describe("QueryPlanner follow-up context", () => {
   it("bounds reference-resolution history consistently in both planning phases", async () => {
     createCompletion
       .mockResolvedValueOnce({
-        choices: [{ message: { content: JSON.stringify({ mode: "initial", queries: [] }) } }],
+        choices: [{ message: { content: JSON.stringify({
+          mode: "initial", use_stored_preferences: false, queries: [],
+        }) } }],
       })
       .mockResolvedValueOnce({
         choices: [{ message: { content: JSON.stringify({ mode: "stop", queries: [] }) } }],
@@ -50,7 +52,9 @@ describe("QueryPlanner follow-up context", () => {
     }));
     createCompletion
       .mockResolvedValueOnce({
-        choices: [{ message: { content: JSON.stringify({ mode: "initial", queries }) } }],
+        choices: [{ message: { content: JSON.stringify({
+          mode: "initial", use_stored_preferences: false, queries,
+        }) } }],
       })
       .mockResolvedValueOnce({
         choices: [{ message: { content: JSON.stringify({ mode: "follow_up", queries }) } }],
@@ -60,7 +64,7 @@ describe("QueryPlanner follow-up context", () => {
     const followUp = await planner.planFollowUp(
       "Compare fictional films.", emptyPreferences(), [], [], 2, 1,
     );
-    expect(initial.map(({ query }) => query)).toEqual(queries.slice(0, 3).map(({ query }) => query));
+    expect(initial.queries.map(({ query }) => query)).toEqual(queries.slice(0, 3).map(({ query }) => query));
     expect(followUp.queries.map(({ query }) => query)).toEqual([queries[0]!.query]);
     const payloads = createCompletion.mock.calls.map(([request]) => JSON.parse(request.messages[1].content));
     expect(payloads.map(({ search_budget }) => search_budget)).toEqual([
@@ -107,6 +111,32 @@ describe("QueryPlanner follow-up context", () => {
       autoMode: "lite", iteration: 2,
     }]);
   });
+
+  it("uses the initial model decision and fixes it for follow-ups without another model call", async () => {
+    createCompletion
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: JSON.stringify({
+          mode: "initial", use_stored_preferences: true, queries: [],
+        }) } }],
+      })
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: JSON.stringify({
+          mode: "stop", use_stored_preferences: false, queries: [],
+        }) } }],
+      });
+    const preferences = { ...emptyPreferences(), genres: ["science fiction"] };
+    const planner = new QueryPlanner("key", "https://example.com", "model", "version", "guidance", 5);
+    const initial = await planner.planInitial("Suggest something for me.", preferences, 8);
+    const followUp = await planner.planFollowUp(
+      "Suggest something for me.", preferences, [], [], 2, 8, [], initial.useStoredPreferences,
+    );
+    expect(createCompletion).toHaveBeenCalledTimes(2);
+    expect(initial.useStoredPreferences).toBe(true);
+    expect(followUp.useStoredPreferences).toBe(true);
+    const payloads = createCompletion.mock.calls.map(([request]) => JSON.parse(request.messages[1].content));
+    expect(payloads[0].supplied_context.movie_preferences).toEqual(preferences);
+    expect(payloads[1].use_stored_preferences).toBe(true);
+  });
 });
 
 describe("parsePlannerOutput", () => {
@@ -114,6 +144,7 @@ describe("parsePlannerOutput", () => {
     const plan = parsePlannerOutput(
       JSON.stringify({
         mode: "initial",
+        use_stored_preferences: false,
         queries: [
           {
             query: "Arrival similar movies",
@@ -160,6 +191,7 @@ describe("parsePlannerOutput", () => {
   it.each(["fast", "initial", null, 42])("rejects unsupported auto_mode %s", (autoMode) => {
     expect(() => parsePlannerOutput(JSON.stringify({
       mode: "initial",
+      use_stored_preferences: false,
       queries: [{ query: "A movie", purpose: "Find evidence.", auto_mode: autoMode }],
     }), "initial", 1, 5)).toThrow('auto_mode must be either "lite" or "advanced"');
   });
@@ -184,6 +216,7 @@ describe("parsePlannerOutput", () => {
     const plan = parsePlannerOutput(
       JSON.stringify({
         mode: "initial",
+        use_stored_preferences: false,
         queries: [],
         request_context: {
           language: null,
@@ -198,6 +231,13 @@ describe("parsePlannerOutput", () => {
     );
 
     expect(plan.queries).toEqual([]);
+    expect(plan.useStoredPreferences).toBe(false);
+  });
+
+  it.each([undefined, null, "true", 1])("rejects a missing or invalid preference decision: %s", (decision) => {
+    expect(() => parsePlannerOutput(JSON.stringify({
+      mode: "initial", use_stored_preferences: decision, queries: [],
+    }), "initial", 1, 5)).toThrow("boolean use_stored_preferences");
   });
 
   it("loads the checked-in guidance", async () => {
