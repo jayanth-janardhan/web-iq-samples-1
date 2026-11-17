@@ -72,6 +72,7 @@ export class MovieModel {
     deployment: string,
     searchLimitReached = false,
     useStoredPreferences = false,
+    retrievalIncomplete = false,
   ): Promise<ChatResult> {
     const answerDurationsMs: number[] = [];
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -90,6 +91,10 @@ export class MovieModel {
           ...(searchLimitReached ? [{
             role: "system" as const,
             content: "The server-enforced Web IQ search budget for this message has been exhausted. Answer only from the available evidence. Explicitly identify unsupported parts of the user's request, and do not imply that research is complete. The application will append a search-limit notice.",
+          }] : []),
+          ...(retrievalIncomplete ? [{
+            role: "system" as const,
+            content: "A follow-up Web IQ retrieval failed and no further retrieval will be attempted for this turn. Answer only from the available evidence. Explicitly identify unsupported parts of the user's request; do not guess or imply that research is complete. The application will append a retrieval-incomplete notice.",
           }] : []),
           ...(attempt === 0 ? [] : [{
             role: "system" as const,
@@ -119,6 +124,8 @@ export class MovieModel {
           ...result,
           message: result.message + (searchLimitReached
             ? "\n\n_Search limit reached for this message; no further searches were made._"
+            : "") + (retrievalIncomplete
+            ? "\n\n_Follow-up retrieval failed. This answer uses only the evidence already collected; some requested information may be missing._"
             : ""),
           answerDurationsMs,
         };

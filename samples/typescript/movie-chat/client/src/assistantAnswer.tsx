@@ -101,17 +101,14 @@ export function QueryDebug() {
       <details className="evidence-inspector">
         <summary>Inspect evidence ({evidence.length} {evidence.length === 1 ? "source" : "sources"})</summary>
         <p className="evidence-intro">
-          This is the deduplicated evidence supplied to the answer model, including sources
-          not cited in its response. Text passages are limited to 3,000 characters per source.
-          {" "}Media sources may contain normalized descriptions.
+          Metadata for the deduplicated evidence supplied to the answer model, including
+          sources not cited in its response.
         </p>
         {evidence.length > 0
           ? <ol className="evidence-list">
               {evidence.map((source) => {
                 const url = safeHttpUrl(source.url);
-                const queries = [...new Set(
-                  source.passages?.map(({ query }) => query) ?? [source.query],
-                )];
+                const queries = source.queries;
                 return (
                   <li key={source.id}>
                     <details className="evidence-source">
@@ -121,12 +118,7 @@ export function QueryDebug() {
                           ? <a href={url} target="_blank" rel="noopener noreferrer">{url}</a>
                           : <span>Source URL unavailable</span>}
                         <span>{queries.length === 1 ? "Query" : "Queries"}: <code>{queries.join("; ")}</code></span>
-                        <p>
-                          <strong>{source.media
-                            ? `${source.media.type === "image" ? "Image" : "Video"} source evidence`
-                            : "Retrieved passage"}</strong>
-                        </p>
-                        <pre className="evidence-content">{source.content}</pre>
+                        {source.updatedAt && <span>Updated: {source.updatedAt}</span>}
                       </div>
                     </details>
                   </li>

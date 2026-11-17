@@ -46,6 +46,10 @@ export interface WebIqSource {
   media?: MediaEvidence;
 }
 
+export interface EvidenceMetadata extends Omit<WebIqSource, "content" | "passages"> {
+  queries: string[];
+}
+
 export type WebIqMode = "lite" | "advanced";
 
 export interface WebIqQuery {
@@ -74,9 +78,10 @@ export interface WebIqCallDebug extends PlannedWebIqQuery {
 
 export interface ChatDebug {
   useStoredPreferences?: boolean;
+  retrievalIncomplete?: boolean;
   modelCalls: ModelCallDebug[];
   webIqCalls: WebIqCallDebug[];
-  evidence: WebIqSource[];
+  evidence: EvidenceMetadata[];
   totals: {
     modelCalls: number;
     webIqCalls: number;

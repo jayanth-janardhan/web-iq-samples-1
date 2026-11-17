@@ -25,12 +25,12 @@ export interface Source {
 }
 
 export interface EvidenceSource extends Source {
-  content: string;
   query: string;
-  passages?: Array<{ query: string; content: string }>;
+  queries: string[];
 }
 
 export interface ChatDebug {
+  retrievalIncomplete?: boolean;
   modelCalls: Array<{
     stage: "query_planning" | "evidence_assessment" | "answer_generation";
     purpose: string;

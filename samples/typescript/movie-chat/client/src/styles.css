@@ -552,22 +552,9 @@ summary:focus-visible {
   overflow-wrap: anywhere;
 }
 
-.evidence-body p {
-  margin-top: 0.65rem;
-}
-
-.evidence-content {
-  max-height: 18rem;
-  margin: 0.5rem 0 0;
-  overflow: auto;
-  padding: 0.65rem;
-  background: rgb(0 0 0 / 25%);
-  color: #d6eafa;
-  font-family: Consolas, "Courier New", monospace;
-  font-size: 0.75rem;
-  line-height: 1.5;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
+.evidence-body > span {
+  display: block;
+  margin-top: 0.5rem;
 }
 
 .composer {

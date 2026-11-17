@@ -150,6 +150,24 @@ describe("MovieModel copying safeguard", () => {
     });
     expect(createCompletion).toHaveBeenCalledTimes(2);
   });
+
+  it("discloses a failed follow-up even after a copying rewrite without claiming budget exhaustion", async () => {
+    createCompletion
+      .mockResolvedValueOnce(completion(`${passage} [1]`))
+      .mockResolvedValueOnce(completion("A supported festival summary [1]."));
+    const result = await new MovieModel("key", "https://example.com", "model", "version")
+      .respond("Compare these films.", [], emptyPreferences(), [source()], "model", false, false, true);
+    expect(result.message).toContain("A supported festival summary [1].");
+    expect(result.message).toContain("Follow-up retrieval failed");
+    expect(result.message).toContain("some requested information may be missing");
+    expect(result.message).not.toContain("Search limit reached");
+    for (const [request] of createCompletion.mock.calls) {
+      expect(request.messages).toContainEqual({
+        role: "system",
+        content: expect.stringContaining("Explicitly identify unsupported parts"),
+      });
+    }
+  });
 });
 
 describe("parseChatResult", () => {

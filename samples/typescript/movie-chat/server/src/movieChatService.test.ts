@@ -13,7 +13,7 @@ import { emptyPreferences } from "./types.js";
 import { SessionStore } from "./sessionStore.js";
 import type { MovieModel } from "./movieModel.js";
 import type { QueryPlanner } from "./queryPlanner.js";
-import { mergeSources, WebIqClient } from "./webIqClient.js";
+import { mergeSources, WebIqClient, WebIqDailyQuotaError, WebIqTransientError } from "./webIqClient.js";
 
 beforeEach(() => {
   vi.spyOn(console, "info").mockImplementation(() => undefined);
@@ -220,7 +220,7 @@ it("retrieves a ranking, fans out to discovered actors, and stops when the plann
     expect(response.debug.totals).toMatchObject({ modelCalls: 4, webIqCalls: 3 });
     expect(response.debug.evidence.map(({ url }) => url))
       .toEqual([ranking.url, ...movieSources.map(({ url }) => url)]);
-    expect(model.respond.mock.calls[0]![3]).toEqual(response.debug.evidence);
+    expect(model.respond.mock.calls[0]![3]).toEqual(mergeSources([ranking], movieSources, 30));
     expect(model.respond.mock.calls[0]![5]).toBe(false);
   } finally {
     sessions.close();
@@ -349,7 +349,13 @@ it.each([
   };
   const webIq = {
     search: vi.fn().mockResolvedValue({
-      sources: [sources[0], mediaSource],
+      sources: [{
+        ...sources[0],
+        passages: [
+          { query: "Arrival reviews", content: "Review content", fingerprint: "internal-fingerprint" },
+          { query: "Another review lookup", content: "Another raw passage" },
+        ],
+      }, mediaSource],
       calls: [{ query: query.query, durationMs: 20, traceId: "poster-trace" }],
     }),
   };
@@ -375,8 +381,22 @@ it.each([
     expect(response.debug.webIqCalls[0]).toMatchObject({
       query: query.query, traceId: "poster-trace",
     });
-    expect(response.debug.evidence).toEqual([sources[0], mediaSource]);
-    expect(response.debug.evidence).toEqual(model.respond.mock.calls[0]![3]);
+    expect(response.debug.evidence).toMatchObject([
+      { id: 1, title: sources[0]!.title, url: sources[0]!.url, query: "Arrival reviews",
+        queries: ["Arrival reviews", "Another review lookup"] },
+      { id: 2, title: mediaSource.title, url: mediaSource.url, query: query.query,
+        queries: [query.query], media: mediaSource.media },
+    ]);
+    expect(model.respond.mock.calls[0]![3][0]).toMatchObject({
+      content: "Review content", passages: expect.arrayContaining([
+        { query: "Another review lookup", content: "Another raw passage" },
+      ]),
+    });
+    for (const source of [...response.debug.evidence, ...response.sources]) {
+      expect(source).not.toHaveProperty("content");
+      expect(source).not.toHaveProperty("passages");
+    }
+    expect(JSON.stringify(response)).not.toMatch(/Review content|Another raw passage|internal-fingerprint/);
     expect(response.sources).toEqual([{
       id: 2, title: mediaSource.title, url: mediaSource.url, media: mediaSource.media,
     }]);
@@ -419,9 +439,108 @@ it("preserves trace IDs across iterations and exposes the final model evidence w
         { query: initialQuery.query, traceId: "review-trace", iteration: 1 },
         { query: nextQuery.query, traceId: "cast-trace", iteration: 2 },
       ]);
-    expect(response.debug.evidence).toEqual(model.respond.mock.calls[0]![3]);
+    expect(model.respond.mock.calls[0]![3]).toEqual([
+      sources[0], { ...sources[1], id: 2 },
+    ]);
     expect(response.debug.evidence.map(({ id }) => id)).toEqual([1, 2]);
     expect(response.sources.map(({ id }) => id)).toEqual([1]);
+  } finally {
+    sessions.close();
+  }
+});
+
+it("answers from retained evidence after follow-up throttling, recording failed attempts and stopping retrieval", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json({
+      results: [{
+        evidence: { type: "text", content: "A synthetic supported fact." },
+        citations: [{ title: "Synthetic review", url: "https://example.com/review" }],
+      }],
+    }))
+    .mockImplementation(async () => Response.json({
+      retryAfter: "1s", traceId: "throttled-follow-up",
+    }, { status: 429 }));
+  vi.stubGlobal("fetch", fetchMock);
+  const sessions = new SessionStore(120, 12);
+  const planner = {
+    planInitial: vi.fn().mockResolvedValue({
+      queries: [{ query: "initial", purpose: "Initial fact", iteration: 1 }],
+      useStoredPreferences: false,
+    }),
+    planFollowUp: vi.fn().mockResolvedValue({
+      queries: [{ query: "gap", purpose: "Missing fact", iteration: 2 }],
+    }),
+  };
+  const model = {
+    respond: vi.fn().mockResolvedValue({ message: "A supported answer [1].", preferences: emptyPreferences() }),
+  };
+  try {
+    const service = new MovieChatService(
+      sessions, new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30),
+      planner as unknown as QueryPlanner, model as unknown as MovieModel, "model",
+      { mode: "iterative", maxIterations: 5, maxQueriesPerIteration: 5, maxTotalQueries: 8 }, 30,
+    );
+    const pending = requestContext.run("partial-answer-request", () => service.chat(undefined, "Compare these films."));
+    await vi.advanceTimersByTimeAsync(5_000);
+    const response = await pending;
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(planner.planFollowUp).toHaveBeenCalledOnce();
+    expect(response.debug.retrievalIncomplete).toBe(true);
+    expect(response.debug.webIqCalls.map(({ query, status, attempt }) => ({ query, status, attempt })))
+      .toEqual([
+        { query: "initial", status: 200, attempt: 1 },
+        ...[1, 2, 3].map((attempt) => ({ query: "gap", status: 429, attempt })),
+      ]);
+    expect(response.debug.totals.webIqCalls).toBe(4);
+    expect(response.sources[0]?.url).toBe("https://example.com/review");
+    expect(model.respond.mock.calls[0]!.slice(5)).toEqual([false, false, true]);
+    expect(model.respond.mock.calls[0]![3][0].content).toBe("A synthetic supported fact.");
+    expect(sessions.getOrCreate(response.sessionId).messages.at(-1)?.content).toBe(response.message);
+    const logs = vi.mocked(console.error).mock.calls.map(([log]) => JSON.parse(log as string));
+    expect(logs).toContainEqual(expect.objectContaining({
+      event: "chat_retrieval_incomplete", requestId: "partial-answer-request",
+      iteration: 2, failedBatchCalls: 3, retainedSourceCount: 1,
+    }));
+    expect(JSON.stringify(logs)).not.toContain("A synthetic supported fact.");
+  } finally {
+    sessions.close();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  }
+});
+
+it.each([
+  { name: "daily quota exhaustion", error: new WebIqDailyQuotaError(), initial: false, evidence: sources },
+  { name: "authentication failure", error: new Error("Web IQ Auto request failed with 401."), initial: false, evidence: sources },
+  { name: "invalid response", error: new Error("Web IQ Auto returned an invalid results array."), initial: false, evidence: sources },
+  { name: "initial throttling", error: new WebIqTransientError("Throttled."), initial: true, evidence: sources },
+  { name: "follow-up failure without evidence", error: new WebIqTransientError("Throttled."), initial: false, evidence: [] },
+])("does not turn $name into a partial success", async ({ error, initial, evidence }) => {
+  const sessions = new SessionStore(120, 12);
+  const planner = {
+    planInitial: vi.fn().mockResolvedValue({
+      queries: [{ query: "initial", purpose: "Initial fact", iteration: 1 }],
+      useStoredPreferences: false,
+    }),
+    planFollowUp: vi.fn().mockResolvedValue({
+      queries: [{ query: "gap", purpose: "Missing fact", iteration: 2 }],
+    }),
+  };
+  const search = vi.fn();
+  if (!initial) search.mockResolvedValueOnce({ sources: evidence, calls: [{ query: "initial", durationMs: 1 }] });
+  search.mockRejectedValueOnce(error);
+  const model = { respond: vi.fn() };
+  try {
+    const service = new MovieChatService(
+      sessions, { search } as unknown as WebIqClient, planner as unknown as QueryPlanner,
+      model as unknown as MovieModel, "model",
+      { mode: "iterative", maxIterations: 5, maxQueriesPerIteration: 5, maxTotalQueries: 8 }, 30,
+    );
+    await expect(service.chat(undefined, "Compare these films.")).rejects.toBe(error);
+    expect(model.respond).not.toHaveBeenCalled();
   } finally {
     sessions.close();
   }

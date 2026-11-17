@@ -88,9 +88,7 @@ describe("Movie Night chat", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("labels evidence types and inspects uncited plain text with safe links without displaying trace IDs", async () => {
-    const firstPassage = 'Retrieved text <script>alert("bad")</script>\n[99] ![tracking](https://untrusted.example/pixel)';
-    const passage = `${firstPassage}\n\nA second synthetic review.`;
+  it("shows evidence metadata and originating queries without a passage display or trace IDs", async () => {
     const debug = reply().debug;
     fetchMock.mockResolvedValue(Response.json(reply({
       debug: {
@@ -101,20 +99,17 @@ describe("Movie Night chat", () => {
         ],
         evidence: [
           { id: 1, title: "Arrival review", url: "https://example.com/arrival",
-            query: "Arrival movie reviews", content: passage, contentSource: "web",
-            passages: [
-              { query: "Arrival movie reviews", content: firstPassage },
-              { query: "Arrival worldwide gross", content: "A second synthetic review." },
-            ] },
+            query: "Arrival movie reviews", contentSource: "web", updatedAt: "2026-10-10",
+            queries: ["Arrival movie reviews", "Arrival worldwide gross"] },
           { id: 2, title: "Uncited cast evidence", url: "https://example.com/cast",
-            query: "Arrival cast", content: "Retrieved cast passage.", contentSource: "News" },
+            query: "Arrival cast", queries: ["Arrival cast"], contentSource: "News" },
           { id: 3, title: "Unsafe evidence URL", url: "javascript:alert(1)",
-            query: "Arrival cast", content: "Plain text only." },
+            query: "Arrival cast", queries: ["Arrival cast"] },
           { id: 4, title: "Titanic poster", url: "https://example.com/titanic",
-            query: "Titanic poster", content: "Poster source evidence.", contentSource: "web",
+            query: "Titanic poster", queries: ["Titanic poster"], contentSource: "web",
             media: { type: "image", imageUrl: "https://images.example.com/titanic.jpg" } },
           { id: 5, title: "Arrival trailer", url: "https://example.com/trailer",
-            query: "Arrival trailer", content: "Trailer source evidence.", contentSource: "web",
+            query: "Arrival trailer", queries: ["Arrival trailer"], contentSource: "web",
             media: { type: "video" } },
         ],
       },
@@ -143,11 +138,11 @@ describe("Movie Night chat", () => {
     const link = within(source).getByRole("link");
     expect(link.getAttribute("href")).toBe("https://example.com/arrival");
     expect(link.getAttribute("rel")).toBe("noopener noreferrer");
-    expect(source.querySelector("pre")?.textContent).toBe(passage);
+    expect(source.querySelector("pre")).toBeNull();
+    expect(within(source).getByText("Updated: 2026-10-10")).toBeTruthy();
     expect(within(source).getByText("Arrival movie reviews; Arrival worldwide gross")).toBeTruthy();
     fireEvent.click(within(inspector).getByText("[2] (News) Uncited cast evidence"));
     expect(within(inspector).getByRole("link", { name: "https://example.com/cast" })).toBeTruthy();
-    expect(within(inspector).getByText("Retrieved cast passage.")).toBeTruthy();
     expect(container.querySelector("script, img, a[href^='javascript:']")).toBeNull();
     expect(screen.queryByRole("button", { name: "View sources: Uncited cast evidence" })).toBeNull();
   });
@@ -347,7 +342,7 @@ describe("Movie Night chat", () => {
       .mockResolvedValueOnce(Response.json(reply({
         debug: { ...debug, evidence: [{
           id: 1, title: "Arrival review", url: "https://example.com/arrival",
-          query: "Arrival movie reviews", content: "Arrival-only evidence.",
+          query: "Arrival movie reviews", queries: ["Arrival movie reviews"],
         }] },
       })))
       .mockResolvedValueOnce(Response.json(reply({
@@ -355,7 +350,7 @@ describe("Movie Night chat", () => {
         sources: [{ id: 1, title: "Dune review", url: "https://example.com/dune" }],
         debug: { ...debug, evidence: [{
           id: 1, title: "Dune review", url: "https://example.com/dune",
-          query: "Dune movie reviews", content: "Dune-only evidence.",
+          query: "Dune movie reviews", queries: ["Dune movie reviews"],
         }] },
       })));
     render(<App />);
@@ -378,10 +373,10 @@ describe("Movie Night chat", () => {
     const inspectors = screen.getAllByText("Inspect evidence (1 source)")
       .map((summary) => summary.closest("details")!);
     expect(inspectors).toHaveLength(2);
-    expect(within(inspectors[0]!).getByText("Arrival-only evidence.")).toBeTruthy();
-    expect(within(inspectors[0]!).queryByText("Dune-only evidence.")).toBeNull();
-    expect(within(inspectors[1]!).getByText("Dune-only evidence.")).toBeTruthy();
-    expect(within(inspectors[1]!).queryByText("Arrival-only evidence.")).toBeNull();
+    expect(within(inspectors[0]!).getByText("Arrival movie reviews")).toBeTruthy();
+    expect(within(inspectors[0]!).queryByText("Dune movie reviews")).toBeNull();
+    expect(within(inspectors[1]!).getByText("Dune movie reviews")).toBeTruthy();
+    expect(within(inspectors[1]!).queryByText("Arrival movie reviews")).toBeNull();
   });
 
   it("prevents concurrent turns or reset, then clears transcript and preferences for a new session", async () => {

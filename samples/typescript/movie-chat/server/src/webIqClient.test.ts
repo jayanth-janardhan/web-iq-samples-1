@@ -3,7 +3,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { WebIqClient } from "./webIqClient.js";
+import { WebIqClient, WebIqTransientError } from "./webIqClient.js";
 
 describe("WebIqClient", () => {
   beforeEach(() => {
@@ -579,6 +579,61 @@ describe("WebIqClient", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(siblingSignal?.aborted).toBe(true);
       expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("carries all dispatched attempts on a transient batch failure, including aborted siblings", async () => {
+      const fetchMock = vi.fn().mockImplementation(async (_url, options) => {
+        if (JSON.parse(options.body).query === "throttled") {
+          return Response.json({}, { status: 429 });
+        }
+        return new Promise<Response>((_resolve, reject) => {
+          options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const failure = await new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30)
+        .search([{ query: "throttled" }, { query: "in flight" }, { query: "queued" }], 3)
+        .catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(WebIqTransientError);
+      expect((failure as WebIqTransientError).calls).toEqual([
+        expect.objectContaining({ query: "throttled", status: 429, attempt: 1 }),
+        expect.objectContaining({ query: "in flight", status: undefined, attempt: 1 }),
+      ]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("classifies a retrieval timeout as transient and counts its dispatched attempt", async () => {
+      const timeout = new AbortController();
+      vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(async (_url, options) =>
+        new Promise<Response>((_resolve, reject) => {
+          options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+        })));
+      const pending = new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30)
+        .search([{ query: "movie" }]);
+      const failure = expect(pending).rejects.toMatchObject({
+        name: "WebIqTransientError",
+        calls: [{ query: "movie", autoMode: "lite", attempt: 1,
+          durationMs: expect.any(Number), traceId: undefined, status: undefined }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      timeout.abort(new DOMException("Retrieval timeout", "TimeoutError"));
+      await failure;
+      expect(fetch).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      { status: 429, payload: { errorCode: "AuthUserDailyUsageExceeded" }, name: "WebIqDailyQuotaError" },
+      { status: 401, payload: {}, name: "Error" },
+    ])("does not mask a concurrent $name with transient throttling", async ({ status, payload, name }) => {
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(async (_url, options) =>
+        JSON.parse(options.body).query === "throttled"
+          ? Response.json({}, { status: 429 })
+          : Response.json(payload, { status })));
+      await expect(new WebIqClient(async () => "test-access-token", "https://api.microsoft.ai/v3", 18000, 30)
+        .search([{ query: "throttled" }, { query: "permanent" }], 2))
+        .rejects.toMatchObject({ name });
+      expect(fetch).toHaveBeenCalledTimes(2);
     });
 
     it("reserves initial attempts for every query within the shared call budget", async () => {

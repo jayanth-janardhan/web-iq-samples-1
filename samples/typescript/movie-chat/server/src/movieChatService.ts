@@ -16,6 +16,7 @@ import {
 } from "./types.js";
 import {
   mergeSources,
+  WebIqTransientError,
   type WebIqClient,
   type WebIqSearchCall,
 } from "./webIqClient.js";
@@ -68,6 +69,7 @@ export class MovieChatService {
     remainingSearches -= initialSearch.calls.length;
     let sources = initialSearch.sources;
     const webIqCalls = toWebIqCallDebug(plannedQueries, initialSearch.calls);
+    let retrievalIncomplete = false;
 
     if (this.queryPlanning.mode === "iterative" && plannedQueries.length > 0) {
       for (
@@ -100,10 +102,25 @@ export class MovieChatService {
           break;
         }
         plannedQueries.push(...queries);
-        const additionalSearch = await this.webIq.search(
-          queries.map(({ query, autoMode = "lite" }) => ({ query, autoMode })),
-          remainingSearches,
-        );
+        let additionalSearch;
+        try {
+          additionalSearch = await this.webIq.search(
+            queries.map(({ query, autoMode = "lite" }) => ({ query, autoMode })),
+            remainingSearches,
+          );
+        } catch (error) {
+          if (!(error instanceof WebIqTransientError) || sources.length === 0) throw error;
+          remainingSearches -= error.calls.length;
+          webIqCalls.push(...toWebIqCallDebug(queries, error.calls));
+          retrievalIncomplete = true;
+          logEvent("chat_retrieval_incomplete", {
+            iteration,
+            errorType: error.name,
+            failedBatchCalls: error.calls.length,
+            retainedSourceCount: sources.length,
+          }, "error");
+          break;
+        }
         remainingSearches -= additionalSearch.calls.length;
         webIqCalls.push(
           ...toWebIqCallDebug(queries, additionalSearch.calls),
@@ -125,6 +142,7 @@ export class MovieChatService {
       this.deployment,
       remainingSearches === 0,
       useStoredPreferences,
+      retrievalIncomplete,
     );
     const answerDurations = result.answerDurationsMs ?? [elapsedMilliseconds(answerStartedAt)];
     modelCalls.push(...answerDurations.map((durationMs, index): ModelCallDebug => ({
@@ -165,9 +183,13 @@ export class MovieChatService {
       webIqQueries: plannedQueries,
       debug: {
         useStoredPreferences,
+        retrievalIncomplete,
         modelCalls,
         webIqCalls,
-        evidence: sources,
+        evidence: sources.map(({ content: _content, passages, ...source }) => ({
+          ...source,
+          queries: [...new Set([source.query, ...(passages?.map(({ query }) => query) ?? [])])],
+        })),
         totals: {
           modelCalls: modelCalls.length,
           webIqCalls: webIqCalls.length,

@@ -57,7 +57,8 @@ describe("createApp", () => {
         ],
         evidence: [{
           id: 1, title: "Arrival review", url: "https://example.com/arrival",
-          content: "Review passage.", query: "science fiction movies similar to Arrival",
+          query: "science fiction movies similar to Arrival",
+          queries: ["science fiction movies similar to Arrival"], contentSource: "web",
         }],
         totals: {
           modelCalls: 2,
@@ -81,7 +82,12 @@ describe("createApp", () => {
     expect(response.body.sessionId).toBe("session-1");
     expect(response.body.webIqQueries).toHaveLength(1);
     expect(response.body.debug.webIqCalls[0].traceId).toBe("review-trace");
-    expect(response.body.debug.evidence[0].content).toBe("Review passage.");
+    expect(response.body.debug.evidence[0]).toMatchObject({
+      query: "science fiction movies similar to Arrival",
+      queries: ["science fiction movies similar to Arrival"], contentSource: "web",
+    });
+    expect(response.body.debug.evidence[0]).not.toHaveProperty("content");
+    expect(response.body.debug.evidence[0]).not.toHaveProperty("passages");
     expect(response.body.debug.totals).toEqual({
       modelCalls: 2,
       webIqCalls: 1,

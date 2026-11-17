@@ -26,6 +26,13 @@ export interface WebIqSearchCall extends WebIqQuery {
   status?: number;
 }
 
+export class WebIqTransientError extends Error {
+  constructor(message: string, readonly calls: WebIqSearchCall[] = []) {
+    super(message);
+    this.name = "WebIqTransientError";
+  }
+}
+
 export interface WebIqSearchResult {
   sources: WebIqSource[];
   calls: WebIqSearchCall[];
@@ -121,17 +128,28 @@ export class WebIqClient {
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
     const deadline = Date.now() + REQUEST_TIMEOUT_MS;
+    const calls: WebIqSearchCall[] = [];
+    const requests = queries.map((query) => this.searchQueued(query, takeRetry, deadline, signal, calls));
     try {
-      const resultSets = await Promise.all(
-        queries.map((query) => this.searchQueued(query, takeRetry, deadline, signal)),
-      );
+      const resultSets = await Promise.all(requests);
       return {
-        sources: mergeSources([], resultSets.flatMap(({ sources }) => sources), this.maxSources),
-        calls: resultSets.flatMap(({ calls }) => calls),
+        sources: mergeSources([], resultSets.flat(), this.maxSources),
+        calls,
       };
     } catch (error) {
       controller.abort();
-      throw error;
+      const settled = await Promise.allSettled(requests);
+      const permanentFailure = settled.find((result) =>
+        result.status === "rejected" && result.reason !== signal.reason
+          && !(result.reason instanceof WebIqTransientError));
+      const failure: unknown = permanentFailure?.status === "rejected" ? permanentFailure.reason : error;
+      if (failure instanceof WebIqTransientError) {
+        throw new WebIqTransientError(failure.message, calls);
+      }
+      if (failure instanceof Error && failure.name === "TimeoutError") {
+        throw new WebIqTransientError("Web IQ retrieval exceeded this request's time limit.", calls);
+      }
+      throw failure;
     }
   }
 
@@ -140,12 +158,13 @@ export class WebIqClient {
     takeRetry: () => boolean,
     deadline: number,
     signal: AbortSignal,
+    calls: WebIqSearchCall[],
   ) {
     while (this.inFlight.size >= MAX_CONCURRENT_REQUESTS) {
       await Promise.race(this.inFlight);
     }
     signal.throwIfAborted();
-    const request = this.searchOne(query, takeRetry, deadline, signal);
+    const request = this.searchOne(query, takeRetry, deadline, signal, calls);
     const settled = request.then(() => undefined, () => undefined);
     this.inFlight.add(settled);
     try {
@@ -160,11 +179,8 @@ export class WebIqClient {
     takeRetry: () => boolean,
     deadline: number,
     signal: AbortSignal,
-  ): Promise<{
-    calls: WebIqSearchCall[];
-    sources: Array<Omit<WebIqSource, "id">>;
-  }> {
-    const calls: WebIqSearchCall[] = [];
+    calls: WebIqSearchCall[],
+  ): Promise<Array<Omit<WebIqSource, "id">>> {
     const logRetrievalDetails = process.env["MOVIE_CHAT_LOG_RETRIEVAL_DETAILS"] !== "false";
     let retryAt = 0;
     for (let attempt = 1; ; attempt += 1) {
@@ -176,12 +192,14 @@ export class WebIqClient {
       let outcome: "success" | "error" = "error";
       let errorType: string | undefined;
       let retryable = false;
+      let dispatched = false;
       try {
         await wait(Math.max(0, retryAt - Date.now()), signal);
         await this.waitForCooldown(deadline, signal);
         const accessToken = await this.getAccessToken();
         await this.waitForCooldown(deadline, signal);
         signal.throwIfAborted();
+        dispatched = true;
         const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/auto`, {
           method: "POST",
           headers: {
@@ -224,9 +242,8 @@ export class WebIqClient {
               this.retryNotBefore = Math.max(this.retryNotBefore, retryAt);
             }
           }
-          throw new Error(
-            `Web IQ Auto request failed with ${response.status} ${response.statusText}.`,
-          );
+          const message = `Web IQ Auto request failed with ${response.status} ${response.statusText}.`;
+          throw retryable ? new WebIqTransientError(message) : new Error(message);
         }
         if (!isRecord(payload) || !Array.isArray(payload.results)) {
           throw new Error("Web IQ Auto returned an invalid results array.");
@@ -235,7 +252,7 @@ export class WebIqClient {
         const sources = payload.results.flatMap((result) => normalizeResult(result, query));
         sourceCount = sources.length;
         outcome = "success";
-        return { calls, sources };
+        return sources;
       } catch (error) {
         errorType = error instanceof Error ? error.name : "UnknownError";
         if (!retryable || attempt >= MAX_ATTEMPTS || retryAt >= deadline || !takeRetry()) {
@@ -244,7 +261,7 @@ export class WebIqClient {
       } finally {
         const durationMs = elapsedMilliseconds(startedAt);
         // Only dispatched HTTP attempts consume the caller's retrieval budget.
-        if (status !== undefined) {
+        if (dispatched) {
           calls.push({ query, autoMode, durationMs, traceId, attempt, status });
         }
         logEvent("webiq_request", {
@@ -267,7 +284,7 @@ export class WebIqClient {
   private async waitForCooldown(deadline: number, signal: AbortSignal): Promise<void> {
     while (this.retryNotBefore > Date.now()) {
       if (this.retryNotBefore >= deadline) {
-        throw new Error("Web IQ is rate limited beyond this request's time limit. Try again later.");
+        throw new WebIqTransientError("Web IQ is rate limited beyond this request's time limit. Try again later.");
       }
       await wait(this.retryNotBefore - Date.now(), signal);
     }
